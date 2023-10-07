@@ -1,15 +1,14 @@
 #![feature(iter_next_chunk, buf_read_has_data_left)]
 
-extern crate arrayvec;
-extern crate bincode;
-extern crate itertools;
-extern crate log;
-extern crate paste;
-extern crate rand;
-extern crate rand_distr;
-extern crate slice_deque;
+extern crate bincode; // en/decoding to file
+extern crate clap;
+extern crate itertools; // some iterator helper tools
+extern crate log; // logging, (duh)
+extern crate paste; // helper to generate test cases
+extern crate rand; // used to generate random inputs
+extern crate rand_distr; // more random input gen
+extern crate slice_deque; // <- better version of Deque that actually turns into a slice
 
-// use arrayvec::ArrayVec;
 use bincode::{config, Decode, Encode};
 use itertools::Itertools;
 use log::{debug, error, info};
@@ -127,7 +126,9 @@ impl<T: Clone + Copy> SlidingWindowArray<T> {
 
         removed
     }
-
+    /**
+     * the above but accepts a vec, returns any values that have been removed
+     */
     pub fn push_many(&mut self, values: Vec<T>) -> Vec<Option<T>> {
         let mut out = Vec::new();
         for val in values {
@@ -135,6 +136,10 @@ impl<T: Clone + Copy> SlidingWindowArray<T> {
         }
         out
     }
+
+    /**
+     * helper code, only pushes if optional exists
+     */
     pub fn push_optional_new(&mut self, value: Option<T>) -> Option<T> {
         match value {
             Some(c) => self.push_new(c),
@@ -142,6 +147,10 @@ impl<T: Clone + Copy> SlidingWindowArray<T> {
         }
     }
 
+    /**
+     * __NOTE__ this function differs as it will always move the left buffer's front value
+     * even if the given value is None.
+     */
     pub fn push_shift_optional_new(&mut self, value: Option<T>) -> Option<T> {
         let removed = if !self.front.is_empty() {
             self.move_front()
@@ -393,19 +402,32 @@ impl LZ77Program {
     }
 }
 
+use clap::Parser;
+
+#[derive(Parser, Debug)]
+struct Args {
+    #[arg(short, long)]
+    decompress: bool,
+
+    #[arg(short, long, default_value_t = 30)]
+    window_size: usize,
+
+    #[arg(short = 'n', long, default_value_t = 26)]
+    dict_size: usize,
+}
+
 fn main() -> Result<(), ErrorTypes> {
     let coder_cfg = config::standard()
         .with_little_endian()
         .with_variable_int_encoding();
 
-    let args = std::env::args().collect_vec();
+    let args = Args::parse();
     let mut handle = BufWriter::new(std::io::stdout());
     let mut handle_in = BufReader::new(std::io::stdin());
-    let do_decomp = args.iter().find(|a| a == &"--decompress" || a == &"-d");
 
-    let mut program = LZ77Program::new(30, 26);
+    let mut program = LZ77Program::new(args.window_size, args.dict_size);
 
-    if do_decomp.is_some() {
+    if args.decompress {
         let result_in: Vec<CompressionTuple> =
             bincode::decode_from_std_read(&mut handle_in, coder_cfg)
                 .expect("failure during decoding input!");
