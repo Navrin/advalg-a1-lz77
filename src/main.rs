@@ -1,32 +1,38 @@
 #![feature(iter_next_chunk, buf_read_has_data_left)]
 
 extern crate arrayvec;
+extern crate bincode;
 extern crate itertools;
+extern crate log;
+extern crate paste;
+extern crate rand;
+extern crate rand_distr;
+extern crate slice_deque;
 
-use arrayvec::ArrayVec;
+// use arrayvec::ArrayVec;
+use bincode::{config, Decode, Encode};
 use itertools::Itertools;
+use log::{debug, error, info};
+use slice_deque::SliceDeque;
 use std::{
-    borrow::BorrowMut,
     error::Error,
     fmt::Display,
-    io::{stdout, BufRead, BufReader, BufWriter, Read, Write},
-    str::from_utf8,
+    io::{BufReader, BufWriter, Write},
 };
 
-macro_rules! ut {
-    () => {
-        u8
-    };
-    (x) => {
-        1
-    };
-}
-
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Encode, Decode, PartialEq)]
 struct CompressionTuple {
-    pos: ut!(),
-    len: ut!(),
+    pos: usize,
+    len: usize,
     next: char,
+}
+impl CompressionTuple {
+    fn new(pos: usize, len: usize, next: char) -> Self {
+        CompressionTuple { pos, len, next }
+    }
+    fn from_tuple((pos, len, next): (usize, usize, char)) -> Self {
+        CompressionTuple { pos, len, next }
+    }
 }
 
 impl Display for CompressionTuple {
@@ -35,330 +41,630 @@ impl Display for CompressionTuple {
     }
 }
 
-macro_rules! println {
-    ($($rest:tt)*) => {
-        if std::env::var("DEBUG").is_ok() {
-            std::println!($($rest)*);
-        }
-    }
-}
-
-const WINDOW_SIZE: ut!() = 30;
-const WINDOW_SIZE_HELPER: usize = WINDOW_SIZE as usize;
-const DICTIONARY_SIZE: ut!() = 10;
-const DICTIONARY_SIZE_HELPER: usize = DICTIONARY_SIZE as usize;
+//const WINDOW_SIZE: usize = 30;
+//const DICTIONARY_SIZE: usize = 26;
 
 #[derive(Debug)]
 enum ErrorTypes {
-    Undersized,
-    BufferOverread,
     InitialUndersized,
     DictionaryUndersized(String),
 }
+
 impl Display for ErrorTypes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        return f.write_str("");
-    }
-}
-
-trait Coder {
-    fn encode<W: Write>(self, out: &mut BufWriter<W>);
-    fn decode<R: Read>(arr: &mut BufReader<R>) -> Self;
-    const DELIM: [u8; 1] = [b'\x1f'];
-    const END: [u8; 1] = [b'\x1e'];
-}
-
-impl Coder for CompressionTuple {
-    fn encode<W: Write>(self, out: &mut BufWriter<W>) {
-        out.write_all(&self.pos.to_ne_bytes()).unwrap();
-        //out.write_all(&Self::DELIM);
-        out.write_all(&self.len.to_ne_bytes()).unwrap();
-        //out.write_all(&Self::DELIM);
-
-        let mut tmp: [u8; 4] = [0; 4];
-        self.next.encode_utf8(&mut tmp);
-        out.write_all(&tmp);
-        //out.write_all(&Self::END);
-    }
-
-    fn decode<R: Read>(arr: &mut BufReader<R>) -> Self {
-        let mut buf: Vec<u8> = Vec::new();
-        let sized = std::mem::size_of::<ut!()>();
-
-        let mut num_buf: [u8; ut!(x)] = [0; ut!(x)];
-        arr.read_exact(&mut num_buf);
-        let pos = <ut!()>::from_ne_bytes(num_buf);
-
-        arr.read_exact(&mut num_buf);
-        let len = <ut!()>::from_ne_bytes(num_buf);
-
-        let mut char_buf: [u8; 4] = [0; 4];
-        arr.read_exact(&mut char_buf);
-        let next = from_utf8(&char_buf).unwrap().chars().next().unwrap();
-
-        CompressionTuple { pos, len, next }
-    }
-}
-
-impl Coder for Vec<CompressionTuple> {
-    fn encode<W: Write>(self, out: &mut BufWriter<W>) {
-        for tpl in self {
-            tpl.encode(out);
+        match self {
+            Self::InitialUndersized => write!(f, "Not enough bytes to compress! (at least 4 needed)"),
+            Self::DictionaryUndersized(_)=> write!(f, "Out of bounds on the dictionary index, possibly bad tuple given / dictionary and/or window size was altered!")
         }
-    }
-
-    fn decode<R: Read>(arr: &mut BufReader<R>) -> Self {
-        let mut out: Self = Vec::new();
-        while arr.has_data_left().unwrap() {
-            let res = CompressionTuple::decode(arr);
-            out.push(res);
-        }
-        out
     }
 }
 
 impl<T> From<arrayvec::CapacityError<T>> for ErrorTypes {
     fn from(value: arrayvec::CapacityError<T>) -> Self {
-        return ErrorTypes::DictionaryUndersized(String::from(value.to_string()));
+        ErrorTypes::DictionaryUndersized(value.to_string())
     }
 }
 
 impl Error for ErrorTypes {}
 
-fn shift_push<T, const CAP: usize>(array: &mut ArrayVec<T, CAP>, value: T) {
-    if (array.remaining_capacity() == 0) {
-        array.pop_at(0);
-    }
-    array.push(value);
-}
-fn shift_push_many<T: Copy, const CAP: usize>(array: &mut ArrayVec<T, CAP>, values: &[T]) {
-    for val in values {
-        shift_push(array, *val)
-    }
+#[derive(Clone)]
+struct SlidingWindowArray<T> {
+    back_cap: usize,
+    front_cap: usize,
+    pub back: SliceDeque<T>,
+    pub front: SliceDeque<T>,
 }
 
-fn find_match(search: &[char], dict: &[char]) -> Option<(ut!(), ut!())> {
-    fn find_match_inner(search: &[char], dict: &[char]) -> Option<(ut!(), ut!())> {
-        let len = search.len();
-        //        let extras = &dict.get(0..len);
-        //
-        //        let dict_wraparound = extras
-        //            .map(|ext| [dict.to_vec(), ext.repeat(len).to_vec()].concat())
-        //            .unwrap_or(dict.to_vec());
-        let repeated = dict.repeat(len);
-        let mut views = repeated.windows(len);
-
-        //println!(
-        //    "wraparound dict windows = {:?}",
-        //    views
-        //        .clone()
-        //        .map(|d| d.to_vec())
-        //        .collect::<Vec<Vec<char>>>()
-        //);
-
-        for pos in 0..views.len() {
-            if let Some(view) = views.next() {
-                if view == search {
-                    return Some((pos as ut!(), len as ut!()));
-                }
-            } else {
-                continue;
-            }
-        }
-
-        None
-    }
-
-    let mut longest_match = None;
-    println!("Initiating search with = {:?}", search);
-    for i in 1..search.len() + 1 {
-        let result = find_match_inner(&search[0..i], dict);
-        match result {
-            Some(v) => {
-                println!("{:?} -> Found result = {:?}", &search[0..i], result);
-                longest_match = Some(v);
-            }
-            None => {
-                return longest_match;
-            }
+impl<T: Clone + Copy> SlidingWindowArray<T> {
+    fn new(back_cap: usize, front_cap: usize) -> Self {
+        SlidingWindowArray {
+            back_cap,
+            front_cap,
+            front: SliceDeque::with_capacity(front_cap),
+            back: SliceDeque::with_capacity(back_cap),
         }
     }
 
-    longest_match
-}
+    pub fn front_remaining_capacity(&self) -> usize {
+        self.front_cap - self.front.len()
+    }
+    pub fn back_remaining_capacity(&self) -> usize {
+        self.back_cap - self.back.len()
+    }
 
-fn compress(input: &str) -> Result<Vec<CompressionTuple>, ErrorTypes> {
-    let total_len = input.len();
-    let mut output = Vec::new();
-    let mut dictionary = ArrayVec::<char, DICTIONARY_SIZE_HELPER>::new();
-    let annotated_chars: Vec<(usize, char)> = input
-        .char_indices()
-        .map(|(idx, c)| (total_len - idx - 1, c))
-        .collect_vec();
-    let mut stream = annotated_chars.iter();
-
-    let mut buf: ArrayVec<char, WINDOW_SIZE_HELPER> = stream
-        .borrow_mut()
-        .map(|(idx, char)| *char)
-        .next_chunk::<WINDOW_SIZE_HELPER>()
-        .map_err(|_| ErrorTypes::InitialUndersized)?
-        .into();
-
-    //let mut last = CompressionTuple {
-    //    pos: 0,
-    //    len: 0,
-    //    next: buf[0],
-    //};
-
-    //output.push(last);
-    //dictionary.push(*buf.first().ok_or(ErrorTypes::UndersizedError)?);
-    let mut cursor = 0;
-    loop {
-        println!("### ITER AT CURSOR {} ###", cursor);
-
-        // check for matches
-        let (pos, len) = find_match(&buf, &dictionary).unwrap_or((0, 0));
-        println!(
-            "det pos, cursor = {}, dict.len = {}, pos = {}",
-            cursor,
-            dictionary.len(),
-            pos
-        );
-        let tuple_pos = dictionary.len() as ut!() - (pos);
-
-        println!(
-            "total read (len+1): {}, dictionary.len = {}",
-            len + 1,
-            dictionary.len()
-        );
-
-        let adv = len as usize + 1;
-        cursor += adv;
-
-        if (adv > DICTIONARY_SIZE_HELPER) {
-            dictionary.clear();
-        } else if (dictionary.remaining_capacity() < adv) {
-            let dr = dictionary
-                .drain(..adv - dictionary.remaining_capacity())
-                .collect::<String>();
-            println!("drain result = {}", dr);
-        }
-
-        println!(
-            "changing buffer with [adv = {}] prestate: {:?}, left = {:?}",
-            adv,
-            buf,
-            stream.clone().collect_vec()
-        );
-        for _ in 0..adv {
-            let rem = buf.pop_at(0);
-            if let Some(r) = rem {
-                dictionary.push(r);
-            }
-
-            let next = stream.next();
-            if let Some((_, c)) = next {
-                buf.push(*c);
-            }
-        }
-
-        // dictionary.try_extend_from_slice(&buf[0..std::cmp::min(adv, WINDOW_SIZE)])?;
-
-        let tuple = CompressionTuple {
-            pos: tuple_pos,
-            len,
-            next: *dictionary.last().unwrap(),
+    fn push_to_back(&mut self, value: T) -> Option<T> {
+        let removed = if self.back_remaining_capacity() == 0 {
+            self.back.pop_front()
+        } else {
+            None
         };
 
-        output.push(tuple);
-        println!(
-            "{} [{:?}] | [{:?}] , stream left: {:?}",
-            tuple, dictionary, buf, stream
-        );
+        self.back.push_back(value);
 
-        if buf.is_empty() {
-            break;
+        removed
+    }
+
+    fn move_front(&mut self) -> Option<T> {
+        let v = self
+            .front
+            .pop_front()
+            .expect("Front capacity is full, but nothing is inside?");
+        self.push_to_back(v)
+    }
+    /**
+     * Pushes a new element to the front array.
+     * If the front array is full, then remove the first element in the front array,
+     * and push it to the back of back-array (dictionary).
+     * returns the removed element from the __back__ array, if any
+     */
+    pub fn push_new(&mut self, value: T) -> Option<T> {
+        let removed = if self.front_remaining_capacity() == 0 {
+            self.move_front()
+        } else {
+            None
+        };
+        self.front.push_back(value);
+
+        removed
+    }
+
+    pub fn push_many(&mut self, values: Vec<T>) -> Vec<Option<T>> {
+        let mut out = Vec::new();
+        for val in values {
+            out.push(self.push_new(val));
+        }
+        out
+    }
+    pub fn push_optional_new(&mut self, value: Option<T>) -> Option<T> {
+        match value {
+            Some(c) => self.push_new(c),
+            None => None,
         }
     }
 
-    return Ok(output);
+    pub fn push_shift_optional_new(&mut self, value: Option<T>) -> Option<T> {
+        let removed = if !self.front.is_empty() {
+            self.move_front()
+        } else {
+            None
+        };
+
+        match value {
+            Some(c) => self.push_new(c),
+            None => removed,
+        }
+    }
+
+    pub fn prepare_advancement(&mut self, n: usize) {
+        if n >= self.back.capacity() {
+            self.back.clear();
+        } else {
+            let _ = self.back.drain(0..n).collect_vec();
+        }
+    }
 }
 
-fn decompress(input: Vec<CompressionTuple>) -> Result<String, ErrorTypes> {
-    let mut out = String::new();
-    let mut dictionary: ArrayVec<char, DICTIONARY_SIZE_HELPER> = ArrayVec::new();
+use std::cell::RefCell;
+use std::rc::Rc;
 
-    println!("### decompression loop! ###");
-    let mut cursor: ut!() = 0;
-    for CompressionTuple { pos, len, next } in input {
-        let relpos = dictionary.len().checked_sub(pos as usize).unwrap_or(0);
+#[derive(Clone)]
+struct LZ77Program {
+    _window_size: usize,
+    _dictionary_size: usize,
+    pub window: Rc<RefCell<SlidingWindowArray<char>>>,
+}
 
-        print!(
-            "[cursor #{}] overall = {} ({}), with = {:?}, on ({}, {}, {}), rel pos = {}",
-            cursor,
-            out,
-            out.len(),
-            dictionary,
-            pos,
-            len,
-            next,
-            relpos
-        );
-        if len == 0 {
-            print!(", simple op");
-        } else if (len as usize + relpos <= dictionary.len()) {
-            print!(", reading dict simple");
-            let dict_temp = dictionary.clone();
-            let read = dict_temp
-                .get(relpos..relpos + len as usize)
-                .ok_or(ErrorTypes::DictionaryUndersized(String::from("Failure")))?;
-
-            out.push_str(&String::from_iter(read));
-            shift_push_many(&mut dictionary, read);
-        } else {
-            print!(", reading dict complex");
-            let wrapped = dictionary
-                .clone()
-                .iter()
-                .cycle()
-                .skip(relpos)
-                .take(len as usize)
-                .collect::<String>();
-            //let rem = dict_temp
-            //    .get(relpos..)
-            //    .ok_or(ErrorTypes::DictionaryUndersized(String::from("Failure")))?;
-            //let wrapped = rem.iter().cycle().take(len).collect::<String>();
-            out.push_str(&wrapped);
-
-            let rem_chars: Vec<char> = wrapped.chars().collect_vec();
-            shift_push_many(&mut dictionary, &rem_chars);
+impl LZ77Program {
+    fn new(win_size: usize, dict_size: usize) -> Self {
+        LZ77Program {
+            _window_size: win_size,
+            _dictionary_size: dict_size,
+            window: Rc::new(RefCell::new(SlidingWindowArray::new(dict_size, win_size))),
         }
-        print!("\n");
-        shift_push(&mut dictionary, next);
-        out.push(next);
-        cursor += len + 1;
+    }
+    fn find_match(
+        &self,
+        window: &SlidingWindowArray<char>,
+        search: &[char],
+        dict: &[char],
+    ) -> Option<(usize, usize)> {
+        let window_size = self._window_size;
+        let maximum_factor = window_size.div_ceil(window.front.len().max(1));
+        /**
+         * 1st. repeat the dictionary so we can represent wrap-around
+         * 2nd. use the "windows" iterator so we can cycle through fixed length
+         *      iterations of the dict. Unlike chunks it will overlap the substring.
+         */
+        fn find_match_inner(
+            search: &[char],
+            dict: &[char],
+            maximum_factor: usize,
+        ) -> Option<(usize, usize)> {
+            let len = search.len();
+            let repeated = dict.repeat(maximum_factor);
+            let mut views = repeated.windows(len);
+
+            for pos in 0..views.len() {
+                if let Some(view) = views.next() {
+                    if view == search {
+                        return Some((pos, len));
+                    }
+                } else {
+                    continue;
+                }
+            }
+
+            None
+        }
+
+        let mut longest_match = None;
+        debug!("Initiating search with = {:?}", search);
+        // range is non inclusive
+        for i in 1..search.len() + 1 {
+            let result = find_match_inner(&search[0..i], dict, maximum_factor);
+
+            match result {
+                Some(v) => {
+                    debug!("{:?} -> Found result = {:?}", &window.front[0..i], result);
+                    longest_match = Some(v);
+                }
+                None => {
+                    return longest_match;
+                }
+            }
+        }
+
+        longest_match
     }
 
-    Ok(out)
+    fn compress(&mut self, input: &str) -> Result<Vec<CompressionTuple>, ErrorTypes> {
+        let mut output = Vec::new();
+        //let mut dictionary = ArrayVec::<char, DICTIONARY_SIZE>::new();
+        //let mut buf: ArrayVec<char, WINDOW_SIZE> = ArrayVec::new();
+        let mut stream = input.chars();
+        let mut window = self.window.borrow_mut();
+
+        for _ in 0..self._window_size {
+            window.push_optional_new(stream.next());
+            //if let Some(c) = stream.next() {
+            //    buf.push(c);
+            //}
+        }
+
+        let mut cursor = 0;
+        loop {
+            debug!("### ITER AT CURSOR {} ###", cursor);
+            // check for matches
+            // we have to also handle the default cases in which no dictionary match was found.
+            let search_space = if window.front.len() < self._window_size && window.front.len() > 0 {
+                &window.front[0..window.front.len() - 1]
+            } else {
+                &window.front[..]
+            };
+            let (pos, len) = self
+                .find_match(&window, search_space, &window.back)
+                .unwrap_or((0, 0));
+
+            debug!(
+                "det pos, cursor = {}, dict.len = {}, pos = {}",
+                cursor,
+                window.back.len(),
+                pos
+            );
+
+            // emitted position is relative to the cursor, e.g. the position is more so a negative
+            // index from the end of the dictionary.
+            // we calculate this before we change any of the buffers/dictionary, as the dictionary
+            // might not be filled yet.
+            let tuple_pos = window.back.len() - (pos);
+
+            debug!(
+                "total read (len+1): {}, dictionary.len = {}",
+                len + 1,
+                window.back.len()
+            );
+
+            let adv = len + 1;
+            cursor += adv;
+            // might be redundant, but if we are reading more than our dict can handle, we should
+            // just clear the dictionary
+            //window.prepare_advancement(adv);
+
+            debug!(
+                "changing buffer with [adv = {}] prestate: {:?}, left = {:?}",
+                adv,
+                window.front,
+                stream.clone().collect_vec()
+            );
+
+            for _ in 0..adv {
+                window.push_shift_optional_new(stream.next());
+            }
+
+            // emit a tuple, it is a bit easier if we do this after moving the buffers around,
+            // especially for when our len is complex and we are performing wraparound.
+            // If we generate the tuple after this and read the last from the dict, we should
+            // have the correct next character.
+
+            let tuple = CompressionTuple {
+                pos: if len == 0 { 0 } else { tuple_pos },
+                len,
+                next: *window.back.last().unwrap(),
+            };
+
+            debug!(
+                "{} [{:?}] | [{:?}] , stream left: {:?}",
+                tuple, window.back, window.front, stream
+            );
+
+            output.push(tuple);
+            // no more work to do.
+            if window.front.is_empty() {
+                break;
+            }
+        }
+
+        window.front.clear();
+        window.back.clear();
+
+        Ok(output)
+    }
+
+    fn decompress(&self, input: Vec<CompressionTuple>) -> Result<String, ErrorTypes> {
+        let mut out = String::new();
+        let mut window = SlidingWindowArray::new(self._dictionary_size, self._window_size);
+
+        debug!("### decompression loop! ###");
+        let mut cursor = 0; // unused, debug info only
+        for CompressionTuple { pos, len, next } in input {
+            // relative position for the dictionary, will give the index that is at "-len"
+            let relpos = window.back.len().saturating_sub(pos);
+
+            debug!(
+                "[cursor #{}] overall = {} ({}), with = {:?}, on ({}, {}, {}), rel pos = {}",
+                cursor,
+                out,
+                out.len(),
+                window.back,
+                pos,
+                len,
+                next,
+                relpos
+            );
+            if len == 0 {
+                debug!(", simple op");
+            } else if len + relpos <= window.back.len() {
+                debug!(", reading dict simple");
+                let window_copy = window.clone();
+                let read = &window_copy.back[relpos..relpos + len];
+
+                out.push_str(&String::from_iter(read));
+                for r in read {
+                    window.push_to_back(*r);
+                }
+            } else {
+                debug!(", reading dict complex");
+                let wrapped = window
+                    .back
+                    .iter()
+                    .cycle()
+                    .skip(relpos)
+                    .take(len)
+                    .collect::<String>();
+
+                out.push_str(&wrapped);
+
+                let rem_chars: Vec<char> = wrapped.chars().collect_vec();
+                for r in rem_chars {
+                    window.push_to_back(r);
+                }
+            }
+
+            debug!("[cursor {}] out state {} <- {}", cursor, out, next);
+            window.push_to_back(next);
+            out.push(next);
+            cursor += len + 1;
+        }
+        debug!("[FINAL] [Decompression] Output is {}", out);
+
+        window.front.clear();
+        window.back.clear();
+        Ok(out)
+    }
 }
 
 fn main() -> Result<(), ErrorTypes> {
-    //let target = "aacaacabcabaaac";
-    //let target = "deffeghhifeddefghiifffgiggh";
-    let target = std::io::read_to_string(std::io::stdin()).unwrap();
-    let result = compress(&target)?;
-    // for c in result.clone() {
-    //   print!("{} ", c);
-    //}
+    let coder_cfg = config::standard()
+        .with_little_endian()
+        .with_variable_int_encoding();
+
+    let args = std::env::args().collect_vec();
     let mut handle = BufWriter::new(std::io::stdout());
-    result.encode(&mut handle);
+    let mut handle_in = BufReader::new(std::io::stdin());
+    let do_decomp = args.iter().find(|a| a == &"--decompress" || a == &"-d");
 
-    //println!("\nattempting to decompress {}", target);
-    //let mut handle_in = BufReader::new(std::io::stdin());
-    //let result_in: Vec<CompressionTuple> = Coder::decode(&mut handle_in);
+    let mut program = LZ77Program::new(30, 26);
 
-    //let decomp = decompress(result_in)?;
-    //println!("decompressed: {}, valid?={}", decomp, decomp == target);
-    //write!(&mut handle, "{}", decomp);
+    if do_decomp.is_some() {
+        let result_in: Vec<CompressionTuple> =
+            bincode::decode_from_std_read(&mut handle_in, coder_cfg)
+                .expect("failure during decoding input!");
+        let decomp = program.decompress(result_in)?;
+        write!(&mut handle, "{}", decomp).expect("couldn't write to stdout!");
+    } else {
+        let target = std::io::read_to_string(handle_in).unwrap();
+        let result = program.compress(&target)?;
+
+        bincode::encode_into_std_write(result, &mut handle, coder_cfg)
+            .expect("Failure during encoding!");
+    }
+
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    macro_rules! build_tuples {
+        [$(($p:literal, $l:literal, $c:literal)),*]=> {
+             vec![$(CompressionTuple::new($p,$l,$c)),*]
+        };
+    }
+
+    macro_rules! assert_output {
+        ($e:expr, $t:expr) => {{
+            let tmp = $t.iter().zip($e.iter());
+            for (k, v) in tmp {
+                assert_eq!(k, v);
+            }
+        }};
+    }
+
+    #[derive(Clone)]
+    struct Setup {
+        target_phrase: String,
+        correct_tuple: Vec<CompressionTuple>,
+        p: LZ77Program,
+    }
+    impl Setup {
+        fn preinit() -> LZ77Program {
+            let _ = env_logger::builder()
+                .is_test(true)
+                .filter_level(log::LevelFilter::Debug)
+                .try_init();
+
+            LZ77Program::new(30, 26)
+        }
+        fn new() -> Self {
+            let p = Setup::preinit();
+            Setup {
+                target_phrase: String::from("abracadabrad"),
+                correct_tuple: build_tuples![
+                    (0, 0, 'a'),
+                    (0, 0, 'b'),
+                    (0, 0, 'r'),
+                    (3, 1, 'c'),
+                    (5, 1, 'd'),
+                    (7, 4, 'd')
+                ],
+                p,
+            }
+        }
+
+        fn new_alt() -> Self {
+            let p = Setup::preinit();
+            Setup {
+                target_phrase: String::from("aacaacabcabaaac"),
+                correct_tuple: build_tuples![
+                    (0, 0, 'a'),
+                    (1, 1, 'c'),
+                    (3, 4, 'b'),
+                    (3, 5, 'a'),
+                    (0, 0, 'c')
+                ],
+                p,
+            }
+        }
+
+        fn new_custom(phrase: &str) -> Self {
+            let mut p = Setup::preinit();
+            Self {
+                target_phrase: String::from(phrase),
+                // hopeful, this is more to test randomisation
+                correct_tuple: p
+                    .compress(phrase)
+                    .expect("Trying to encode custom phrase failed"),
+                p,
+            }
+        }
+    }
+
+    fn compress_fw(mut setup: Setup) -> Vec<CompressionTuple> {
+        let result = setup
+            .p
+            .compress(&setup.target_phrase)
+            .expect("Error while compressing");
+
+        assert_output!(result, setup.correct_tuple);
+        result
+    }
+
+    fn decompress_fw(setup: Setup) -> String {
+        let result = setup
+            .p
+            .decompress(setup.correct_tuple)
+            .expect("Could not decompress given tuple!");
+
+        assert_eq!(result, setup.target_phrase);
+
+        result
+    }
+
+    #[test]
+    fn it_can_compress() {
+        let setup = Setup::new();
+        compress_fw(setup);
+    }
+
+    #[test]
+    fn it_can_compress_alt() {
+        let setup = Setup::new_alt();
+        compress_fw(setup);
+    }
+    #[test]
+    fn it_can_decompress() {
+        let setup = Setup::new();
+        decompress_fw(setup);
+    }
+
+    #[test]
+    fn it_can_compress_and_decompress() {
+        let setup = Setup::new();
+        let result = compress_fw(setup.clone());
+        let output = setup
+            .p
+            .decompress(result)
+            .expect("Error attempting to decompress prior compressed input");
+
+        assert_eq!(output, setup.target_phrase);
+    }
+
+    // from rust cookbook, meant for password generation
+    // but will work for our input fuzzing.
+    use rand::distributions::Alphanumeric;
+    use rand::prelude::Distribution;
+    use rand::{thread_rng, Rng};
+
+    fn compress_n_fw<D>(mut p: LZ77Program, n: usize, chars_gen: &mut D, do_decomp: bool)
+    where
+        D: Iterator<Item = char>,
+    {
+        for _ in 0..n {
+            let phrase_buf = chars_gen
+                .next_chunk::<40>()
+                .expect("Error with random number generation!");
+
+            let phrase = phrase_buf.into_iter().collect::<String>();
+
+            let comp_result = p.compress(&phrase);
+            assert!(
+                comp_result.is_ok(),
+                "Compression of phrase {} failed!",
+                phrase
+            );
+            let comp_result = comp_result.unwrap();
+            if do_decomp {
+                let decomp_result = p.decompress(comp_result);
+                assert!(
+                    decomp_result.is_ok(),
+                    "Attempting to decompress phrase {} failed",
+                    phrase
+                );
+                assert_eq!(phrase, decomp_result.unwrap());
+            }
+        }
+    }
+
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ\
+                        abcdefghijklmnopqrstuvwxyz\
+                        0123456789)(*&^%$#@!~";
+
+    macro_rules! random_n {
+        ($n:tt) => {
+            paste::paste! {
+            #[test]
+            fn [<it_can_compress_random_n_ $n >] () {
+            let mut gen = thread_rng();
+            let setup = Setup::new();
+
+
+            let mut chars_gen = std::iter::repeat(())
+                .map(|()| gen.sample(Alphanumeric))
+                .map(char::from);
+
+                compress_n_fw(setup.p, $n, &mut chars_gen, false);
+            }
+
+            #[test]
+            fn [<it_can_decompress_n_ $n>]() {
+                let setup = Setup::new();
+                let mut gen = thread_rng();
+                let mut chars_gen = std::iter::repeat(())
+                    .map(|()| gen.sample(Alphanumeric))
+                    .map(char::from);
+
+                compress_n_fw(setup.p, $n, &mut chars_gen, true)
+            }
+            }
+        };
+    }
+
+    random_n!(10);
+    random_n!(30);
+    random_n!(100);
+    random_n!(500);
+
+    use rand::distributions as dist;
+    macro_rules! nonuniform_n {
+        ($n:tt) => {
+            paste::paste! {
+                #[test]
+                fn [<it_can_compress_nonuniform_n_ $n >] () {
+                    let mut gen = thread_rng();
+                    let setup = Setup::new();
+                    let range_of: Vec<f32> = gen.clone().sample_iter(dist::Standard).take(12).collect_vec();
+                    let biased_dist = dist::WeightedIndex::new(&range_of).unwrap();
+
+                    let mut iter = std::iter::repeat(())
+                        .map(|()| CHARSET[biased_dist.sample(&mut gen)+6])
+                        .map(char::from);
+
+                    compress_n_fw(setup.p,$n, &mut iter, false)
+                }
+
+                #[test]
+                fn [<it_can_decompress_nonuniform_n_ $n >] () {
+                    let mut gen = thread_rng();
+                    let setup = Setup::new();
+                    let range_of: Vec<f32> = gen.clone().sample_iter(dist::Standard).take(8).collect_vec();
+                    let biased_dist = dist::WeightedIndex::new(&range_of).unwrap();
+
+                    let mut iter = std::iter::repeat(())
+                        .map(|()| CHARSET[biased_dist.sample(&mut gen)])
+                        .map(char::from);
+
+                    compress_n_fw(setup.p, $n, &mut iter, true)
+                }
+            }
+        };
+    }
+
+    nonuniform_n!(10);
+    nonuniform_n!(20);
+    nonuniform_n!(30);
+    nonuniform_n!(50);
+    nonuniform_n!(100);
+
+    #[test]
+    fn it_can_encode_to_file() {}
 }
